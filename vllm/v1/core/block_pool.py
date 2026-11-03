@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections import OrderedDict
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
@@ -200,6 +201,10 @@ class BlockPool:
         # Callbacks for blocks released with ``unpin_blocks`` whose contents
         # are still being read until the pool reuses them.
         self._reuse_watchers: dict[int, Callable[[KVCacheBlock], None]] = {}
+        self._hybrid_scan_resistant = False
+        self._reused_block_ids: set[int] = set()
+        self._hybrid_state_group_ids: set[int] = set()
+        self._evicted_prefixes: OrderedDict[BlockHash, None] = OrderedDict()
 
     def get_cached_block(
         self, block_hash: BlockHash, kv_cache_group_ids: list[int]
@@ -627,6 +632,14 @@ class BlockPool:
         block: KVCacheBlock,
         num_tokens: int | None,
     ) -> None:
+        if (
+            self._hybrid_scan_resistant
+            and get_group_id(block_hash_with_group_id) in self._hybrid_state_group_ids
+            and get_block_hash(block_hash_with_group_id) in self._evicted_prefixes
+        ):
+            # Keep the shared record so every recurrent group can be promoted.
+            self._evicted_prefixes.move_to_end(get_block_hash(block_hash_with_group_id))
+            self._reused_block_ids.add(block.block_id)
         if block.block_hash == block_hash_with_group_id:
             return
 
@@ -676,6 +689,8 @@ class BlockPool:
             raise ValueError(f"Cannot get {num_blocks} free blocks from the pool")
 
         ret: list[KVCacheBlock] = self.free_block_queue.popleft_n(num_blocks)
+        if self._hybrid_scan_resistant:
+            self._reused_block_ids.difference_update(b.block_id for b in ret)
 
         if self._reuse_watchers:
             self._notify_reuse(ret)
@@ -743,6 +758,17 @@ class BlockPool:
             # The block doesn't have hash, eviction is not needed
             return False
 
+        if self._hybrid_scan_resistant:
+            # Remember demand beyond residency without retaining physical pages.
+            for block_hash in evicted_hashes:
+                if get_group_id(block_hash) not in self._hybrid_state_group_ids:
+                    continue
+                # One demand record per prefix, independent of group partitioning.
+                prefix_hash = get_block_hash(block_hash)
+                self._evicted_prefixes[prefix_hash] = None
+                self._evicted_prefixes.move_to_end(prefix_hash)
+            while len(self._evicted_prefixes) > self.num_gpu_blocks:
+                self._evicted_prefixes.popitem(last=False)
         self._emit_block_removed_events(evicted_hashes)
         return True
 
@@ -760,6 +786,8 @@ class BlockPool:
             if block.ref_cnt == 0 and not block.is_null:
                 self.free_block_queue.remove(block)
             block.ref_cnt += 1
+            if self._hybrid_scan_resistant and not block.is_null:
+                self._reused_block_ids.add(block.block_id)
             if self.metrics_collector:
                 self.metrics_collector.on_block_accessed(block)
 
@@ -778,6 +806,7 @@ class BlockPool:
         # Identify blocks with hash (LRU cache) and without it (never match APC)
         blocks_to_evict_last = []
         blocks_to_evict_first = []
+        probation_blocks = []
         other_pools: dict[BlockPool, list[KVCacheBlock]] = {}
         for block in ordered_blocks:
             if block.pool is not None and block.pool is not self:
@@ -790,8 +819,26 @@ class BlockPool:
                     blocks_to_evict_first.append(block)
                 else:
                     # FIFO reuse of cached blocks for LRU eviction behavior.
-                    blocks_to_evict_last.append(block)
+                    if (
+                        self._hybrid_scan_resistant
+                        and block.block_id not in self._reused_block_ids
+                    ):
+                        probation_blocks.append(block)
+                    else:
+                        blocks_to_evict_last.append(block)
 
+        if probation_blocks:
+            # Fill unused capacity first, then evict unproven prefixes before
+            # older residents. A real cache hit promotes a block to LRU.
+            unused = []
+            for block in self.free_block_queue.get_all_free_blocks():
+                if (
+                    block.block_hash is None
+                    and block.block_id not in self._reuse_watchers
+                ):
+                    self.free_block_queue.remove(block)
+                    unused.append(block)
+            self.free_block_queue.prepend_n(unused + probation_blocks)
         # Blocks to reuse first are prepended to the front of the free queue.
         self.free_block_queue.prepend_n(blocks_to_evict_first)
         # Blocks to reuse last are appended to the end of the free queue.
@@ -839,6 +886,8 @@ class BlockPool:
         # Remove all hashes so that no new blocks will hit.
         self.cached_block_hash_to_block = BlockHashToBlockMap()
         self.cached_block_hashes_by_block.clear()
+        self._reused_block_ids.clear()
+        self._evicted_prefixes.clear()
         if self._reuse_watchers:
             self._notify_reuse(
                 [self.blocks[block_id] for block_id in list(self._reuse_watchers)]

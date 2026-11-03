@@ -618,6 +618,33 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
     thus multiple kv cache groups.
     """
 
+    def _protect_reused_checkpoint_prefix(self, request: Request) -> None:
+        pool = self.block_pool
+        if not pool._hybrid_state_group_ids:
+            return
+        # A recurrent checkpoint is useful only with its full KV prefix.
+        checkpoint_tokens = min(
+            max(
+                (
+                    block.block_hash_num_tokens or 0
+                    for block in self.single_type_managers[group_id].req_to_blocks[
+                        request.request_id
+                    ]
+                    if block.block_id in pool._reused_block_ids
+                    and block.block_hash is not None
+                ),
+                default=0,
+            )
+            for group_id in pool._hybrid_state_group_ids
+        )
+        for manager in self.single_type_managers:
+            if isinstance(manager.kv_cache_spec, FullAttentionSpec):
+                for block in manager.req_to_blocks[request.request_id][
+                    : checkpoint_tokens // manager.block_size
+                ]:
+                    if not block.is_null and block.block_hash is not None:
+                        pool._reused_block_ids.add(block.block_id)
+
     def __init__(
         self,
         kv_cache_config: KVCacheConfig,
@@ -785,6 +812,16 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
         self.full_attention_group_id: int | None = (
             first.group_ids[0] if isinstance(first.spec, FullAttentionSpec) else None
         )
+        if self.full_attention_group_id is not None and any(
+            isinstance(group.spec, MambaSpec) for group in self.attention_groups
+        ):
+            self.block_pool._hybrid_scan_resistant = True
+            self.block_pool._hybrid_state_group_ids = {
+                group_id
+                for group in self.attention_groups
+                if isinstance(group.spec, MambaSpec)
+                for group_id in group.group_ids
+            }
 
         # Propagate the eagle bit to each manager (default to ``use_eagle=False``).
         for group in self.attention_groups:
@@ -837,6 +874,8 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
                 retention_interval=self.retention_interval,
                 replay_boundaries=boundaries,
             )
+
+        self._protect_reused_checkpoint_prefix(request)
 
     def find_longest_cache_hit(
         self,
